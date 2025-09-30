@@ -24,7 +24,7 @@ from airflow.models.dag import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.google.cloud.sensors.pubsub import PubSubPullSensor
 from google.api_core.client_options import ClientOptions
-from google.cloud import alloydb_v1alpha as alloydb
+from google.cloud import alloydb_v1 as alloydb
 
 # [START import_variables]
 # It is highly recommended to use Airflow Variables for these values
@@ -36,7 +36,7 @@ ALLOYDB_REGION = "australia-southeast2"
 ALLOYDB_CLUSTER_ID = "export-to-alloydb"
 ALLOYDB_DATABASE_ID = "admin-primary"
 ALLOYDB_CLUSTER_ID = "admin"
-ALLOYDB_USER = "postrges"
+ALLOYDB_USER = "postgres"
 ALLOYDB_TABLE = "export"
 # [END import_variables]
 
@@ -84,32 +84,58 @@ def parse_pubsub_message_and_trigger_import(
     
     
     # Extract the job status and destination URI from the Cloud Logging audit log message
-    job_status = message_data.get("protoPayload", {}).get("status", {}).get("message", "")
-    destination_uri = message_data.get("protoPayload", {}).get("metadata", {}).get("tableDataChange", {}).get("jobName", "").split("destinationTable:")[1] if "destinationTable:" in message_data.get("protoPayload", {}).get("metadata", {}).get("tableDataChange", {}).get("jobName", "") else None
+    job_status = message_data.get("state", "")
     
-    if "Success" in job_status and destination_uri:
-        logging.info("BigQuery job completed successfully. Triggering AlloyDB import.")
+    # destination_uri = message_data.get("protoPayload", {}).get("metadata", {}).get("tableDataChange", {}).get("jobName", "").split("destinationTable:")[1] if "destinationTable:" in message_data.get("protoPayload", {}).get("metadata", {}).get("tableDataChange", {}).get("jobName", "") else None
+
+     # Correctly extract the URI from the 'params' and 'query' keys
+    destination_uri = None
+    query = message_data.get("params", {}).get("query", "")
+    if "uri='" in query:
+        # Find the URI string and strip the quotes and surrounding parentheses
+        start_index = query.find("uri='") + 5
+        end_index = query.find("'", start_index)
+        destination_uri = query[start_index:end_index]
+        logging.info(f"extracted uri is: {destination_uri} and job status is {job_status}")
+    
+    destination_uri='gs://fcip_test_bucket/ocv/000000000000.csv'
+
+    if job_status == "SUCCEEDED" and destination_uri:
+        logging.info(f"BigQuery job completed successfully. Triggering AlloyDB import. destintion_uri is {destination_uri}")
 
         # AlloyDB requires a CSV format for import from GCS
+       # import_request = {
+        #    "name": f"projects/{project_id}/locations/{region}/clusters/{cluster_id}",
+         #   "gcs_uri": destination_uri,          # e.g. gs://bucket/path/file.csv (or .sql/.gz)
+          #  "database": db_id,                    # target DB name (not resource path)
+           # "user": user,                         # DB user to run the import as
+       #     "csv_import_options": {               # for CSV imports
+       #         "table": table                    # target table name
+       #         # "columns": ["col1","col2"],    # optional
+       #         # "field_delimiter": "2C",       # optional: comma
+       #         # "quote_character": "22",       # optional: double-quote
+       #         # "escape_character": "5C",      # optional: backslash
+       #     },
+       #s }
+
+
         import_request = {
-            "parent": f"projects/{project_id}/locations/{region}/clusters/{cluster_id}",
-            "request_id": f"import-job-{datetime.now().strftime('%Y%m%d%H%M%S')}",
-            "gcs_source": {
-                "uri": destination_uri
-            },
+            "name": f"projects/{project_id}/locations/{region}/clusters/{cluster_id}",
+            "gcs_uri": "gs://fcip_test_bucket/ocv/000000000000.csv",
             "database": db_id,
-            "table": table,
-            "csv_import_options": {},
+            "user": user,
+            "csv_import_options": { "table": table },
         }
+
         
         # Initialize the AlloyDB client
-        client_options = ClientOptions(api_endpoint=f"{region}-alloydb.googleapis.com")
+        client_options = ClientOptions(api_endpoint="alloydb.googleapis.com")
         client = alloydb.AlloyDBAdminClient(client_options=client_options)
         
         # Invoke the import API
         try:
             logging.info(f"Importing data from {destination_uri} to AlloyDB table {table}")
-            operation = client.import_data(**import_request)
+            operation = client.import_cluster(request=import_request)
             # You can poll the operation status here if needed
             logging.info(f"AlloyDB import operation started: {operation.operation.name}")
             return operation.operation.name
